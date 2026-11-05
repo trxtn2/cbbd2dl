@@ -1,0 +1,6 @@
+{
+  "rewrites": [
+    { "source": "/.netlify/functions/store", "destination": "/api/store" },
+    { "source": "/.netlify/functions/:path*", "destination": "/api/:path*" }
+  ]
+}
