@@ -1,13 +1,16 @@
+import { Pool } from "pg";
 
-
-
-// Document store backing the league app (replaces the Firebase Firestore connection that only
-// existed inside Gemini Canvas). Data lives in the `league_docs` table as (collection, id) → JSON.
-//
-//   POST { action: "sync", since }        → every document changed since `since` (ms)
-//   POST { action: "get", refs }          → the latest copy of specific documents
-//   POST { action: "commit", ops, checks } → atomically apply writes; `checks` are optimistic
-//                                            concurrency preconditions (version per document)
+// Initialize database pool using Vercel's DATABASE_URL environment variable
+let pool: Pool;
+function getDatabase() {
+  if (!pool) {
+    pool = new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+    });
+  }
+  return { pool };
+}
 
 type Ref = { collection: string; id: string };
 type Op = Ref & { type: "set" | "update"; data: Record<string, unknown>; merge?: boolean };
@@ -16,7 +19,7 @@ type Check = Ref & { version: number | null };
 const db = getDatabase();
 const NAME = /^[A-Za-z0-9_-]{1,64}$/;
 const ID = /^[^/]{1,200}$/;
-const OVERLAP_MS = 15000; // re-send recent changes so slow commits are never missed by a poller
+const OVERLAP_MS = 15000;
 
 const validRef = (r: any): boolean =>
   r && typeof r.collection === "string" && NAME.test(r.collection) && typeof r.id === "string" && ID.test(r.id);
@@ -24,7 +27,7 @@ const keyOf = (r: Ref) => r.collection + "/" + r.id;
 const isObj = (v: any): boolean => !!v && typeof v === "object" && !Array.isArray(v);
 const clone = (v: any): any => (v === undefined ? v : JSON.parse(JSON.stringify(v)));
 
-// Resolve Firestore-style field sentinels (serverTimestamp, arrayUnion) against the current value.
+// Resolve Firestore-style field sentinels (serverTimestamp, arrayUnion) against current values
 function resolve(cur: any, v: any, now: number): any {
   if (isObj(v) && v.__fsop === "serverTimestamp") return now;
   if (isObj(v) && v.__fsop === "arrayUnion") {
@@ -44,7 +47,7 @@ function resolve(cur: any, v: any, now: number): any {
   return v;
 }
 
-// set+merge: deep-merge maps (Firestore semantics).
+// set+merge: deep-merge maps
 function deepMerge(base: Record<string, any>, data: Record<string, any>, now: number) {
   for (const [k, v] of Object.entries(data)) {
     if (isObj(v) && !v.__fsop && isObj(base[k])) deepMerge(base[k], v, now);
@@ -53,7 +56,7 @@ function deepMerge(base: Record<string, any>, data: Record<string, any>, now: nu
   return base;
 }
 
-// update: replace top-level fields; dotted keys address nested fields.
+// update: replace top-level fields; dotted keys address nested fields
 function applyUpdate(base: Record<string, any>, data: Record<string, any>, now: number) {
   for (const [k, v] of Object.entries(data)) {
     const parts = k.split(".");
@@ -103,7 +106,6 @@ async function commit(ops: Op[], checks: Check[]) {
   const client = await db.pool.connect();
   try {
     await client.query("BEGIN");
-    // Lock every touched document (including ones that don't exist yet) in a fixed order.
     for (const k of keys) await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [k]);
 
     const current = new Map<string, { data: Record<string, any>; version: number } | null>();
@@ -141,35 +143,4 @@ async function commit(ops: Op[], checks: Check[]) {
     }
 
     for (const [k, data] of next) {
-      const i = k.indexOf("/");
-      await client.query(
-        `INSERT INTO league_docs (collection, id, data, version, updated_at) VALUES ($1, $2, $3::jsonb, 1, $4)
-         ON CONFLICT (collection, id) DO UPDATE SET data = EXCLUDED.data, version = league_docs.version + 1, updated_at = EXCLUDED.updated_at`,
-        [k.slice(0, i), k.slice(i + 1), JSON.stringify(data), now]
-      );
-    }
-    await client.query("COMMIT");
-    return json({ ok: true, now });
-  } catch (e) {
-    await client.query("ROLLBACK").catch(() => {});
-    throw e;
-  } finally {
-    client.release();
-  }
-}
-
-export async function POST(req: Request) {
-  let body: any;
-  try { body = await req.json(); } catch { return json({ error: "Invalid JSON" }, 400); }
-  try {
-    if (body.action === "sync") return await sync(Number(body.since) || 0);
-    if (body.action === "get") return await get(body.refs);
-    if (body.action === "commit") return await commit(body.ops, body.checks);
-    return json({ error: "Unknown action" }, 400);
-  } catch (e) {
-    console.error("store error", e);
-    return json({ error: "Database error" }, 500);
-  }
-}
-
-
+      const
